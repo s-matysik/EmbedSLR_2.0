@@ -119,6 +119,9 @@ def _pipeline(
     model: str,
     out: Path,
     top_n: int | None,
+    use_mcda: bool = False,
+    mcda_method: str = "l_scoring",
+    mcda_weights: Optional[Dict[str, float]] = None,
 ) -> Path:
     """
     Executes the full EmbedSLR workflow and returns the path to the ZIP of results.
@@ -127,6 +130,10 @@ def _pipeline(
     from .embeddings import get_embeddings
     from .similarity import rank_by_cosine
     from .bibliometrics import full_report
+    from .ranking import (rank_by_keywords, rank_by_references, rank_by_citations,
+                         compute_keyword_frequency, compute_reference_frequency,
+                         detailed_frequency_report)
+    from .mcda import l_scoring, z_scoring, l_scoring_plus, mcda_report
 
     df = _ensure_aux_columns(df.copy())
 
@@ -156,6 +163,70 @@ def _pipeline(
     # 6. Full bibliometric report
     rep = out / "biblio_report.txt"
     full_report(ranked, path=rep, top_n=top_n)
+    
+    # New MCDA functionality
+    if use_mcda:
+        print("⏳ Computing keyword rankings...")
+        ranked = rank_by_keywords(ranked, top_k=5)
+        
+        print("⏳ Computing reference rankings...")
+        ranked = rank_by_references(ranked, top_b=15)
+        
+        print("⏳ Computing citation rankings...")
+        ranked = rank_by_citations(ranked)
+        
+        print("⏳ Generating frequency reports...")
+        kw_counter, kw_freq = compute_keyword_frequency(ranked)
+        ref_counter, ref_freq = compute_reference_frequency(ranked)
+        
+        kw_freq.to_csv(out / "keyword_frequencies.csv", index=False)
+        ref_freq.to_csv(out / "reference_frequencies.csv", index=False)
+        
+        freq_report = out / "frequency_report.txt"
+        detailed_frequency_report(kw_freq, ref_freq, path=freq_report)
+        
+        if mcda_weights is None:
+            mcda_weights = {
+                "semantic": 0.4,
+                "keywords": 0.3,
+                "references": 0.2,
+                "citations": 0.1
+            }
+        
+        criteria = {
+            "semantic": "distance_cosine",
+            "keywords": "keywords_points",
+            "references": "references_points",
+            "citations": "citations_points"
+        }
+        
+        ascending = {
+            "semantic": True,
+            "keywords": False,
+            "references": False,
+            "citations": False
+        }
+        
+        print(f"⏳ Applying {mcda_method}...")
+        if mcda_method == "l_scoring":
+            mcda_result = l_scoring(ranked, criteria, mcda_weights, ascending)
+        elif mcda_method == "z_scoring":
+            mcda_result = z_scoring(ranked, criteria, mcda_weights, ascending)
+        elif mcda_method == "l_scoring_plus":
+            mcda_result = l_scoring_plus(ranked, criteria, mcda_weights, ascending,
+                                        bonus_threshold=2.0, max_bonus_threshold=4.0)
+        else:
+            raise ValueError(f"Unknown MCDA method: {mcda_method}")
+        
+        mcda_result.to_csv(out / "mcda_ranking.csv", index=False)
+        
+        if top_n:
+            mcda_result.head(top_n).to_csv(out / "mcda_topN.csv", index=False)
+        
+        mcda_rep = out / "mcda_report.txt"
+        mcda_report(mcda_result, method=mcda_method, path=mcda_rep)
+        
+        ranked = mcda_result
 
     # 7. ZIP with results
     zf = out / "embedslr_results.zip"
@@ -164,6 +235,16 @@ def _pipeline(
         if p_top:
             z.write(p_top, "topN.csv")
         z.write(rep, "biblio_report.txt")
+        
+        if use_mcda:
+            z.write(out / "mcda_ranking.csv", "mcda_ranking.csv")
+            if top_n:
+                z.write(out / "mcda_topN.csv", "mcda_topN.csv")
+            z.write(out / "mcda_report.txt", "mcda_report.txt")
+            z.write(out / "keyword_frequencies.csv", "keyword_frequencies.csv")
+            z.write(out / "reference_frequencies.csv", "reference_frequencies.csv")
+            z.write(out / "frequency_report.txt", "frequency_report.txt")
+    
     return zf
 
 
@@ -231,6 +312,47 @@ def run(save_dir: str | os.PathLike | None = None):
         key = _ask(f"🔑  {key_env} (ENTER = skip)")
         if key:
             os.environ[key_env] = key
+    
+    # New MCDA options
+    use_mcda_input = _ask("🎯  Use Multi-Criteria Decision Analysis? (y/N)", "N").lower()
+    use_mcda = use_mcda_input == 'y'
+    
+    mcda_method = "l_scoring"
+    mcda_weights = None
+    
+    if use_mcda:
+        print("\n📊  Available MCDA methods:")
+        print("  1. l_scoring (Linear Scoring - default)")
+        print("  2. z_scoring (Z-Score normalization)")
+        print("  3. l_scoring_plus (Linear Scoring with bonuses)")
+        
+        mcda_choice = _ask("Choose method", "1")
+        
+        if mcda_choice == "2":
+            mcda_method = "z_scoring"
+        elif mcda_choice == "3":
+            mcda_method = "l_scoring_plus"
+        else:
+            mcda_method = "l_scoring"
+        
+        print(f"✓  Selected: {mcda_method}\n")
+        
+        custom_weights_input = _ask("Use custom weights? (y/N)", "N").lower()
+        if custom_weights_input == 'y':
+            print("📏  Enter weights (must sum to 1.0):")
+            w_sem = float(_ask("    Semantic similarity", "0.4"))
+            w_kw = float(_ask("    Keywords", "0.3"))
+            w_ref = float(_ask("    References", "0.2"))
+            w_cit = float(_ask("    Citations", "0.1"))
+            
+            mcda_weights = {
+                "semantic": w_sem,
+                "keywords": w_kw,
+                "references": w_ref,
+                "citations": w_cit
+            }
+            total = sum(mcda_weights.values())
+            print(f"✓  Weights set (sum = {total:.4f})\n")
 
     # Output folder
     out_dir = Path(save_dir or os.getcwd()).absolute()
@@ -245,12 +367,19 @@ def run(save_dir: str | os.PathLike | None = None):
         model=model,
         out=out_dir,
         top_n=top_n,
+        use_mcda=use_mcda,
+        mcda_method=mcda_method,
+        mcda_weights=mcda_weights,
     )
 
     print("\n✅  Done!")
     print("📁  Results saved to:", out_dir)
     print("🎁  ZIP package:", zip_path)
-    print("   (ranking.csv, topN.csv – if selected, biblio_report.txt)\n")
+    if use_mcda:
+        print("   (ranking.csv, topN.csv, biblio_report.txt,")
+        print("    mcda_ranking.csv, mcda_report.txt, frequency reports)\n")
+    else:
+        print("   (ranking.csv, topN.csv – if selected, biblio_report.txt)\n")
 
 
 if __name__ == "__main__":
